@@ -1,0 +1,55 @@
+name: seal-build
+
+# Build-and-pack only: the test suite runs on Travis (.travis.yml).
+# The public bcpkix-jdk15on-1.60.jar's classes were compiled by JDK 8 (Originally-Created-By
+# 25.171-b11) at source/target 1.5 with the project's Ant build (bc+-build.xml build-pkix,
+# debug off) and the jar was pack200-repacked, so this mirrors that toolchain.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Install Ant 1.8.4
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o ant.tar.gz https://archive.apache.org/dist/ant/binaries/apache-ant-1.8.4-bin.tar.gz
+          tar -xzf ant.tar.gz
+          echo "ANT_HOME=$RUNNER_TEMP/apache-ant-1.8.4" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/apache-ant-1.8.4/bin" >> "$GITHUB_PATH"
+
+      - name: Build pkix jar
+        env:
+          ANT_OPTS: -Xmx1g
+        run: |
+          set -euo pipefail
+          java -version
+          ant -version
+          # Ant 1.8.4 has no javac1.8 adapter, so name the compiler explicitly.
+          ANTARGS="-Dbuild.compiler=modern -Dbc.javac.source=1.5 -Dbc.javac.target=1.5 -Djdk.name=jdk1.5 -Dsrc.dir=build/jdk1.5 -Dartifacts.dir=build/artifacts/jdk1.5 -Dtarget.prefix=jdk15on"
+          # jdk15+.xml init stages the sources; then the provider jar (compile classpath for
+          # pkix) and the pkix jar, without the javadoc targets jdk15+.xml chains after them.
+          ant -Dbuild.compiler=modern -f ant/jdk15+.xml init
+          # bc+-build.xml declares basedir="." (= ant/ when invoked directly); jdk15+.xml runs it
+          # with dir="." at the repo root, so pin basedir there for bc-build.properties and docs/.
+          ant $ANTARGS -Dbasedir="$GITHUB_WORKSPACE" -f ant/bc+-build.xml build-provider build-pkix
+          JAR=build/artifacts/jdk1.5/jars/bcpkix-jdk15on-160.jar
+          mkdir -p seal-out
+          pack200 --repack --segment-limit=-1 seal-out/bcpkix-jdk15on-1.60.jar "$JAR"
+          unzip -l seal-out/bcpkix-jdk15on-1.60.jar | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcpkix-jdk15on-1.60
+          path: seal-out/bcpkix-jdk15on-1.60.jar
+          if-no-files-found: error

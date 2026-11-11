@@ -1,3 +1,34 @@
-language: java
-jdk:
-  - openjdk8
+language: shell
+dist: jammy
+
+# The project ships build.gradle in Gradle 4 syntax (testCompile, `task ... <<`) and no
+# wrapper, so a current image's system Gradle cannot run it; install the JDK 8 + Gradle 4.10.3
+# toolchain explicitly and run the project's own test definition (subprojects' `*AllTests`
+# filter). bcpkix's own module (pkix) plus the core and prov modules it compiles against,
+# one module per job.
+env:
+  jobs:
+    - TEST_TASKS=":pkix:test"
+    - TEST_TASKS=":core:test"
+    - TEST_TASKS=":prov:test"
+
+before_install:
+  - curl -fsSL -o /tmp/jdk8.tar.gz https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk8u222-b10/OpenJDK8U-jdk_x64_linux_hotspot_8u222b10.tar.gz
+  - mkdir -p $HOME/jdk8 && tar -xzf /tmp/jdk8.tar.gz -C $HOME/jdk8 --strip-components=1
+  - export JAVA_HOME=$HOME/jdk8
+  - curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-4.10.3-bin.zip
+  - unzip -q /tmp/gradle.zip -d $HOME
+  - export PATH=$JAVA_HOME/bin:$HOME/gradle-4.10.3/bin:$PATH
+  - java -version
+  - gradle --version
+
+install: true
+
+before_script:
+  - (while sleep 240; do echo "keepalive - tests still running"; done) &
+
+script:
+  - gradle --no-daemon --console=plain -s --init-script .travis/seal-test-logging.gradle $TEST_TASKS
+
+after_script:
+  - sh .travis/wait-for-log.sh gradle 1800

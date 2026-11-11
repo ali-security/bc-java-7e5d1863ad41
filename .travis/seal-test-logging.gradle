@@ -1,0 +1,18 @@
+// Print per-test results and a per-task summary so the Travis log states how many tests ran.
+allprojects {
+    tasks.withType(Test) { t ->
+        t.testLogging {
+            events 'passed', 'skipped', 'failed'
+            exceptionFormat 'full'
+        }
+        t.afterSuite { desc, result ->
+            if (desc.parent == null) {
+                println("TEST SUMMARY " + t.path + ": " + result.resultType +
+                        " tests=" + result.testCount +
+                        " passed=" + result.successfulTestCount +
+                        " failed=" + result.failedTestCount +
+                        " skipped=" + result.skippedTestCount)
+            }
+        }
+    }
+}
