@@ -1,6 +1,11 @@
 package org.bouncycastle.pkcs.jcajce;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigInteger;
+import java.security.AccessControlException;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.security.Provider;
 
 import javax.crypto.Cipher;
@@ -119,6 +124,10 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
                             ScryptParams params = ScryptParams.getInstance(alg.getKeyDerivationFunc().getParameters());
                             AlgorithmIdentifier encScheme = AlgorithmIdentifier.getInstance(alg.getEncryptionScheme());
 
+                            // The KDF cost travels in the unauthenticated container, so bound it
+                            // before deriving the key to cap the memory-exhaustion vector.
+                            checkScryptCost(params);
+
                             SecretKeyFactory keyFact = helper.createSecretKeyFactory("SCRYPT");
 
                             key = keyFact.generateSecret(new ScryptKeySpec(password,
@@ -192,5 +201,79 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
                 };
             }
         };
+    }
+
+    /**
+     * Upper bound, in bytes, on the scrypt working memory (~128 * r * N for the V array and
+     * ~128 * r * p for the B array, RFC 7914) honoured when decrypting a PBES2-protected
+     * container. The scrypt cost travels in the unauthenticated container, so an unbounded cost
+     * is a memory-exhaustion vector. Default 1073741824 (1 GiB).
+     */
+    private static final String PBE_MAX_SCRYPT_MEMORY = "org.bouncycastle.pbe.max_scrypt_memory";
+    private static final int DEFAULT_MAX_SCRYPT_MEMORY = 1 << 30;
+
+    // The KDF cost parameters of a PBES2-protected key arrive in an unauthenticated container, so
+    // they are bounded before the (memory/CPU intensive) derivation to cap a decryption-time DoS.
+    private static final int MAX_SCRYPT_BLOCK_SIZE = 1024;
+
+    private static void checkScryptCost(ScryptParams params)
+        throws IOException
+    {
+        BigInteger n = params.getCostParameter();
+        BigInteger r = params.getBlockSize();
+        BigInteger p = params.getParallelizationParameter();
+
+        if (n == null || r == null || p == null
+            || n.signum() <= 0 || r.signum() <= 0 || p.signum() <= 0
+            || n.bitLength() > 31 || r.bitLength() > 31 || p.bitLength() > 31)
+        {
+            throw new IOException("invalid scrypt parameters");
+        }
+
+        long blockSize = r.longValue();
+        if (blockSize > MAX_SCRYPT_BLOCK_SIZE)
+        {
+            throw new IOException("scrypt block size (" + blockSize + ") greater than " + MAX_SCRYPT_BLOCK_SIZE);
+        }
+
+        long maxMemory = getIntProperty(PBE_MAX_SCRYPT_MEMORY, DEFAULT_MAX_SCRYPT_MEMORY);
+        // scrypt allocates ~128*r*N bytes (the V array) and ~128*r*p bytes (the B array), RFC 7914.
+        // The parallelization parameter p must be bounded as well, otherwise a crafted key with small N
+        // and p near the engine's overflow ceiling (~2e6) allocates hundreds of MB past this budget.
+        // Bound N and p separately against the budget rather than their sum, so the N limit is
+        // preserved exactly (a key with N at the boundary still loads) while p is bounded.
+        long maxCost = maxMemory / (128L * blockSize);
+        if (n.longValue() > maxCost || p.longValue() > maxCost)
+        {
+            throw new IOException("scrypt cost parameters require more than " + maxMemory + " bytes");
+        }
+    }
+
+    private static int getIntProperty(final String propertyName, int defaultValue)
+    {
+        // Read directly rather than through org.bouncycastle.util.Properties: that class is
+        // shipped by the provider jar, which is resolved independently of this one.
+        String p = (String)AccessController.doPrivileged(new PrivilegedAction()
+        {
+            // JDK 1.4 compatibility
+            public Object run()
+            {
+                try
+                {
+                    return System.getProperty(propertyName);
+                }
+                catch (AccessControlException e)
+                {
+                    return null;
+                }
+            }
+        });
+
+        if (p != null)
+        {
+            return Integer.parseInt(p);
+        }
+
+        return defaultValue;
     }
 }

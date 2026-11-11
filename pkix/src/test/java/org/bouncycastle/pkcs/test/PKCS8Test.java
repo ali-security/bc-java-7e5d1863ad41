@@ -1,12 +1,16 @@
 package org.bouncycastle.pkcs.test;
 
+import java.io.IOException;
 import java.math.BigInteger;
 import java.security.Security;
 
 import junit.framework.TestCase;
 import org.bouncycastle.asn1.DERNull;
+import org.bouncycastle.asn1.misc.MiscObjectIdentifiers;
+import org.bouncycastle.asn1.misc.ScryptParams;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo;
+import org.bouncycastle.asn1.pkcs.KeyDerivationFunc;
 import org.bouncycastle.asn1.pkcs.PBES2Parameters;
 import org.bouncycastle.asn1.pkcs.PBKDF2Params;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
@@ -16,8 +20,10 @@ import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.crypto.util.PBKDFConfig;
 import org.bouncycastle.crypto.util.ScryptConfig;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.operator.InputDecryptorProvider;
 import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfo;
 import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfoBuilder;
+import org.bouncycastle.pkcs.PKCSException;
 import org.bouncycastle.pkcs.jcajce.JcePKCSPBEInputDecryptorProviderBuilder;
 import org.bouncycastle.pkcs.jcajce.JcePKCSPBEOutputEncryptorBuilder;
 import org.bouncycastle.util.Arrays;
@@ -26,6 +32,8 @@ import org.bouncycastle.util.encoders.Base64;
 public class PKCS8Test
     extends TestCase
 {
+    private static final String PBE_MAX_SCRYPT_MEMORY = "org.bouncycastle.pbe.max_scrypt_memory";
+
     private static BigInteger modulus = new BigInteger(
         "b6ce33ccbf839457b0d32487b6c807bca584f85c627466b787fc09d0b1f73d97c9a381eca20e0ba851d317a8964327fa0010de76c" +
             "6c0facb83f13612752d166b49d9ba272c38c9a4ed71a94ea69f7bbdc63d7a5c5d3f3c039223e4ac1bb5d433c6bf01e68364a7ef4f" +
@@ -208,5 +216,204 @@ public class PKCS8Test
         PrivateKeyInfo pkInfo = info.decryptPrivateKeyInfo(new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()));
 
         assertTrue(Arrays.areEqual(scryptKey, pkInfo.getEncoded()));
+    }
+
+    /**
+     * Rebuild a PBES2/scrypt protected key with attacker chosen scrypt cost (N) and block size (r).
+     */
+    private static PKCS8EncryptedPrivateKeyInfo withScryptParams(
+        PKCS8EncryptedPrivateKeyInfo encInfo,
+        BigInteger costParameter,
+        BigInteger blockSize)
+        throws IOException
+    {
+        return withScryptParams(encInfo, costParameter, blockSize, null);
+    }
+
+    /**
+     * Rebuild a PBES2/scrypt protected key with attacker chosen scrypt cost (N), block size (r) and,
+     * when non-null, parallelization parameter (p).
+     */
+    private static PKCS8EncryptedPrivateKeyInfo withScryptParams(
+        PKCS8EncryptedPrivateKeyInfo encInfo,
+        BigInteger costParameter,
+        BigInteger blockSize,
+        BigInteger parallelization)
+        throws IOException
+    {
+        EncryptedPrivateKeyInfo info = encInfo.toASN1Structure();
+        PBES2Parameters pbeParams = PBES2Parameters.getInstance(info.getEncryptionAlgorithm().getParameters());
+        assertEquals(MiscObjectIdentifiers.id_scrypt, pbeParams.getKeyDerivationFunc().getAlgorithm());
+        ScryptParams scrypt = ScryptParams.getInstance(pbeParams.getKeyDerivationFunc().getParameters());
+
+        PBES2Parameters rebuilt = new PBES2Parameters(
+            new KeyDerivationFunc(MiscObjectIdentifiers.id_scrypt,
+                new ScryptParams(scrypt.getSalt(), costParameter, blockSize,
+                    parallelization != null ? parallelization : scrypt.getParallelizationParameter(), scrypt.getKeyLength())),
+            pbeParams.getEncryptionScheme());
+
+        EncryptedPrivateKeyInfo tampered = new EncryptedPrivateKeyInfo(
+            new AlgorithmIdentifier(PKCSObjectIdentifiers.id_PBES2, rebuilt), info.getEncryptedData());
+
+        return new PKCS8EncryptedPrivateKeyInfo(tampered.getEncoded());
+    }
+
+    private static void checkDecryptRejected(
+        PKCS8EncryptedPrivateKeyInfo encInfo,
+        InputDecryptorProvider decryptorProvider,
+        String expected)
+    {
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(decryptorProvider);
+            fail("excessive key-derivation cost accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf(expected) >= 0);
+        }
+    }
+
+    private static String setProperty(String name, String value)
+    {
+        String old = System.getProperty(name);
+
+        if (value == null)
+        {
+            System.clearProperty(name);
+        }
+        else
+        {
+            System.setProperty(name, value);
+        }
+
+        return old;
+    }
+
+    /**
+     * The scrypt cost parameters travel in the unauthenticated container: N = 2^24 with
+     * r = 8 asks for 16 GiB of working memory and must be refused before the derivation runs.
+     */
+    public void testScryptCostBound()
+        throws Exception
+    {
+        PKCS8EncryptedPrivateKeyInfo encInfo = withScryptParams(
+            new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(1 << 24), BigInteger.valueOf(8));
+
+        String old = setProperty(PBE_MAX_SCRYPT_MEMORY, null);
+        try
+        {
+            checkDecryptRejected(encInfo,
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()),
+                "scrypt cost parameters require more than 1073741824 bytes");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_SCRYPT_MEMORY, old);
+        }
+    }
+
+    public void testScryptBlockSizeBound()
+        throws Exception
+    {
+        PKCS8EncryptedPrivateKeyInfo encInfo = withScryptParams(
+            new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(2), BigInteger.valueOf(1025));
+
+        checkDecryptRejected(encInfo,
+            new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()),
+            "scrypt block size (1025) greater than 1024");
+    }
+
+    /**
+     * Malformed scrypt parameters - including a cost of 2^32 + 1024 that would truncate to a
+     * plausible 1024 through intValue() - are rejected before the derivation.
+     */
+    public void testScryptInvalidParameters()
+        throws Exception
+    {
+        InputDecryptorProvider decryptorProvider =
+            new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray());
+
+        checkDecryptRejected(withScryptParams(
+            new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(0), BigInteger.valueOf(8)),
+            decryptorProvider, "invalid scrypt parameters");
+
+        checkDecryptRejected(withScryptParams(
+            new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(1024), BigInteger.valueOf(-1)),
+            decryptorProvider, "invalid scrypt parameters");
+
+        checkDecryptRejected(withScryptParams(
+            new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(2).pow(32).add(BigInteger.valueOf(1024)), BigInteger.valueOf(8)),
+            decryptorProvider, "invalid scrypt parameters");
+    }
+
+    public void testScryptParallelizationBound()
+        throws Exception
+    {
+        // scrypt also allocates ~128 * r * p bytes for its B array, so the parallelization
+        // parameter p is held to the same memory budget as N. A genuine key with p exactly at
+        // the bound (128 * r * p = 1 MiB) still decrypts, one byte less of budget refuses it.
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfoBuilder(scryptKey).build(
+            new JcePKCSPBEOutputEncryptorBuilder(new ScryptConfig.Builder(16, 8, 1024).withSaltLength(20).build(), NISTObjectIdentifiers.id_aes256_CBC)
+                .setProvider("BC")
+                .build("Rabbit".toCharArray()));
+
+        String old = setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(1024 * 1024));
+        try
+        {
+            PrivateKeyInfo pkInfo = encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()));
+
+            assertTrue("scrypt key round trip failed", Arrays.areEqual(scryptKey, pkInfo.getEncoded()));
+
+            setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(1024 * 1024 - 1));
+
+            checkDecryptRejected(encInfo,
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()),
+                "scrypt cost parameters require more than 1048575 bytes");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_SCRYPT_MEMORY, old);
+        }
+    }
+
+    public void testScryptParallelizationEngineCeiling()
+        throws Exception
+    {
+        // attacker-crafted scrypt parameters: tiny N, but p at the engine's ceiling for r = 1
+        // (Integer.MAX_VALUE / 1024), which needs 128 * r * p = 256 MiB for the B array alone.
+        // With a 64 MiB budget this has to be refused before any allocation is attempted.
+        PKCS8EncryptedPrivateKeyInfo encInfo = withScryptParams(
+            new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(2), BigInteger.ONE,
+            BigInteger.valueOf(Integer.MAX_VALUE / 1024));
+
+        String old = setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(64 * 1024 * 1024));
+        try
+        {
+            checkDecryptRejected(encInfo,
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()),
+                "scrypt cost parameters require more than 67108864 bytes");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_SCRYPT_MEMORY, old);
+        }
+    }
+
+    public void testScryptParallelizationInvalid()
+        throws Exception
+    {
+        // a non-positive p, or one that does not fit in an int (and so would be silently
+        // truncated by intValue()), must be rejected outright.
+        BigInteger[] hostile = { BigInteger.ZERO, BigInteger.valueOf(-1), BigInteger.ONE.shiftLeft(32).add(BigInteger.ONE) };
+
+        for (int i = 0; i != hostile.length; i++)
+        {
+            checkDecryptRejected(withScryptParams(
+                new PKCS8EncryptedPrivateKeyInfo(pkcs8Scrypt), BigInteger.valueOf(2), BigInteger.ONE, hostile[i]),
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()),
+                "invalid scrypt parameters");
+        }
     }
 }
